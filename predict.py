@@ -1,20 +1,31 @@
+"""
+predict.py
+
+Inference for DAM V8 model.
+
+Key differences from V6:
+  - Model predicts log-price directly (no baseline addition)
+  - Inverse transform: scaled log → expm1 → actual price
+  - Uses V8 artifacts: best_model_dam_v7.pth, dam_scaler_v7.joblib, dam_log_price_scaler_v7.joblib
+"""
+
 import json
 import joblib
 import torch
 import numpy as np
 import pandas as pd
 
-from V6_model_DAM import DAM_V3
-from V6_data_loader_DAM import PAST_FEATURES, FUTURE_FEATURES, SCALE_FEATURES
-from V6_build_inputs_from_json_DAM import build_dam_inputs_from_json
+from V8_model_DAM import DAM_V3
+from V8_data_loader_DAM import PAST_FEATURES, FUTURE_FEATURES, SCALE_FEATURES, BINARY_FEATURES
+from V8_build_inputs_from_json_DAM import build_dam_inputs_from_json
 
 # =====================================================
-# PATHS
+# PATHS  — update these to match your saved artifacts
 # =====================================================
 
-MODEL_PATH = "best_model_dam_v6.pth"
-SCALER_PATH = "dam_scaler6.joblib"
-TARGET_SCALER_PATH = "dam_return_scaler6.joblib"
+MODEL_PATH        = "best_model_dam_v7.pth"
+SCALER_PATH       = "dam_scaler_v7.joblib"
+TARGET_SCALER_PATH= "dam_log_price_scaler_v7.joblib"
 
 # =====================================================
 # DEVICE
@@ -28,9 +39,9 @@ print(f"Running on {device}")
 # =====================================================
 
 feature_scaler = joblib.load(SCALER_PATH)
-target_scaler = joblib.load(TARGET_SCALER_PATH)
+target_scaler  = joblib.load(TARGET_SCALER_PATH)
 
-target_mean = float(target_scaler.mean_[0])
+target_mean  = float(target_scaler.mean_[0])
 target_scale = float(target_scaler.scale_[0])
 
 model = DAM_V3(
@@ -39,103 +50,129 @@ model = DAM_V3(
     n_hidden=256,
 )
 
-state_dict = torch.load(MODEL_PATH, map_location=device)
-model.load_state_dict(state_dict)
+model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
 model.to(device)
 model.eval()
 
 print("Model loaded")
 
+# Columns to scale (excludes binary flags)
+PAST_SCALE_COLS   = [c for c in PAST_FEATURES   if c in SCALE_FEATURES]
+FUTURE_SCALE_COLS = [c for c in FUTURE_FEATURES if c in SCALE_FEATURES]
+
 
 def _scale_inputs(x_past_df: pd.DataFrame, x_future_df: pd.DataFrame):
+    """
+    Scale past and future features using the train-fitted feature_scaler.
+    Binary features are passed through unchanged.
+    """
     x_past_scaled = x_past_df.copy()
-    past_scale_cols = [c for c in PAST_FEATURES if c in SCALE_FEATURES]
-    if past_scale_cols:
-        x_past_scaled[past_scale_cols] = feature_scaler.transform(x_past_scaled[past_scale_cols])
+    x_past_scaled[PAST_SCALE_COLS] = feature_scaler.transform(
+        x_past_df[PAST_SCALE_COLS]
+    )
 
+    # Future: build a dummy frame with all SCALE_FEATURES to use the scaler,
+    # then pull only the future columns back out
     x_future_scaled = x_future_df.copy()
-    future_scale_cols = [c for c in FUTURE_FEATURES if c in SCALE_FEATURES]
-
     dummy = pd.DataFrame(
         np.zeros((len(x_future_df), len(SCALE_FEATURES))),
         columns=SCALE_FEATURES,
     )
-    dummy[future_scale_cols] = x_future_df[future_scale_cols]
-
-    dummy_scaled = feature_scaler.transform(dummy)
-    dummy_scaled = pd.DataFrame(dummy_scaled, columns=SCALE_FEATURES)
-    x_future_scaled[future_scale_cols] = dummy_scaled[future_scale_cols]
+    dummy[FUTURE_SCALE_COLS] = x_future_df[FUTURE_SCALE_COLS].values
+    dummy_scaled = pd.DataFrame(
+        feature_scaler.transform(dummy),
+        columns=SCALE_FEATURES,
+    )
+    x_future_scaled[FUTURE_SCALE_COLS] = dummy_scaled[FUTURE_SCALE_COLS].values
 
     return x_past_scaled, x_future_scaled
 
 
-def predict_dam_from_payload(payload: dict):
+def predict_dam_from_payload(payload: dict) -> dict:
+    """
+    Main inference entry point.
+
+    Args:
+        payload: dict with keys:
+            - prediction_date : str  e.g. "2026-06-20"
+            - region          : str  e.g. "Telangana"
+            - market_data     : list of market records (DAM + GDAM)
+            - weather_data    : list of hourly weather records
+
+    Returns:
+        dict with keys:
+            - region
+            - prediction_date
+            - forecast : list of 96 dicts with block, P10, P50, P90
+    """
     if not isinstance(payload, dict):
         raise ValueError("Payload must be a dictionary")
 
-    region = payload.get("region", "Telangana")
+    region          = payload.get("region", "Telangana")
     prediction_date = payload.get("prediction_date")
     if not prediction_date:
-        raise ValueError("payload must contain prediction_date")
+        raise ValueError("payload must contain 'prediction_date'")
 
-    x_past_df, x_future_df, baseline_df = build_dam_inputs_from_json(
+    # Build raw feature DataFrames
+    x_past_df, x_future_df = build_dam_inputs_from_json(
         payload=payload,
         prediction_date=prediction_date,
         region=region,
         save_csv=False,
     )
 
-    baseline_price = baseline_df["baseline_price"].values
-    if len(baseline_price) != 96:
-        raise ValueError("baseline must contain exactly 96 rows")
-
-    expected_past_features = len(PAST_FEATURES)
-    expected_future_features = len(FUTURE_FEATURES)
-
-    if x_past_df.shape != (1344, expected_past_features):
+    # Validate shapes
+    if x_past_df.shape != (1344, len(PAST_FEATURES)):
         raise ValueError(
-            f"Expected x_past shape (1344, {expected_past_features}), got {x_past_df.shape}"
+            f"Expected x_past (1344, {len(PAST_FEATURES)}), got {x_past_df.shape}"
+        )
+    if x_future_df.shape != (96, len(FUTURE_FEATURES)):
+        raise ValueError(
+            f"Expected x_future (96, {len(FUTURE_FEATURES)}), got {x_future_df.shape}"
         )
 
-    if x_future_df.shape != (96, expected_future_features):
-        raise ValueError(
-            f"Expected x_future shape (96, {expected_future_features}), got {x_future_df.shape}"
-        )
-
+    # Scale
     x_past_scaled, x_future_scaled = _scale_inputs(x_past_df, x_future_df)
 
-    x_past_tensor = torch.FloatTensor(x_past_scaled.values).unsqueeze(0).to(device)
+    # Tensors
+    x_past_tensor   = torch.FloatTensor(x_past_scaled.values).unsqueeze(0).to(device)
     x_future_tensor = torch.FloatTensor(x_future_scaled.values).unsqueeze(0).to(device)
 
+    # Forward pass
     with torch.no_grad():
-        pred_q = model(x_past_tensor, x_future_tensor)
+        pred_q = model(x_past_tensor, x_future_tensor)  # (1, 96, 3)
 
-    pred_q = pred_q.cpu().numpy()[0]  # (96, 3)
-    pred_diffs = pred_q * target_scale + target_mean
+    pred_q = pred_q.cpu().numpy()[0]  # (96, 3) — scaled log-price
 
-    p10_diff = pred_diffs[:, 0]
-    p50_diff = pred_diffs[:, 1]
-    p90_diff = pred_diffs[:, 2]
+    # Inverse transform: scaled log → log → price
+    def inv(arr):
+        log_price = arr * target_scale + target_mean
+        return np.clip(np.expm1(log_price), 0, 10_000)
 
-    p10_price = np.clip(baseline_price + p10_diff, 0, 10000)
-    p50_price = np.clip(baseline_price + p50_diff, 0, 10000)
-    p90_price = np.clip(baseline_price + p90_diff, 0, 10000)
+    p10 = inv(pred_q[:, 0])
+    p50 = inv(pred_q[:, 1])
+    p90 = inv(pred_q[:, 2])
 
-    forecast_rows = []
-    for i in range(96):
-        forecast_rows.append({
+    forecast = [
+        {
             "block": i + 1,
-            "P10": round(float(p10_price[i]), 2),
-            "P50": round(float(p50_price[i]), 2),
-            "P90": round(float(p90_price[i]), 2),
-        })
+            "P10":   round(float(p10[i]), 2),
+            "P50":   round(float(p50[i]), 2),
+            "P90":   round(float(p90[i]), 2),
+        }
+        for i in range(96)
+    ]
 
     return {
-        "region": region,
+        "region":          region,
         "prediction_date": str(pd.Timestamp(prediction_date).date()),
-        "forecast": forecast_rows,
+        "forecast":        forecast,
     }
 
+
+# =====================================================
+# MAIN
+# =====================================================
 
 if __name__ == "__main__":
     with open("json_inputs/payload.json", "r", encoding="utf-8") as f:
@@ -146,5 +183,5 @@ if __name__ == "__main__":
     with open("dam_forecast.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
-    print("Forecast Saved: dam_forecast.json")
-    print(output["forecast"][:3])
+    print("Forecast saved: dam_forecast.json")
+    print(f"First 3 blocks: {output['forecast'][:3]}")
